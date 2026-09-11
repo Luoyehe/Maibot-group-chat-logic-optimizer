@@ -1,0 +1,44 @@
+{
+  "manifest_version": 2,
+  "version": "2.0.1",
+  "name": "群聊逻辑优化",
+  "description": "通过 Hook 集中提供访问控制（白名单/黑名单/全量）、Embedding+对话状态指向判断与纯规则降级、低延迟调度、回复目标去重、技术话题防幻觉、自然语气、多模态桥接、表情包冷却。",
+  "author": {
+    "name": "local",
+    "url": "https://example.com/maibot/group-chat-logic-optimizer"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://example.com/maibot/group-chat-logic-optimizer",
+    "homepage": "https://example.com/maibot/group-chat-logic-optimizer",
+    "documentation": "https://example.com/maibot/group-chat-logic-optimizer",
+    "issues": "https://example.com/maibot/group-chat-logic-optimizer/issues"
+  },
+  "host_application": {
+    "min_version": "1.2.0",
+    "max_version": "1.2.99"
+  },
+  "sdk": {
+    "min_version": "2.5.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "tomlkit",
+      "version_spec": ">=0.11,<0.15"
+    }
+  ],
+  "capabilities": [
+    "config.get",
+    "llm.get_available_models",
+    "llm.embed"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "local.group-chat-logic-optimizer"
+}
