@@ -4,16 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import time
 from pathlib import Path
 from typing import Any
 
 
 class FakeEmbedding:
-    def __init__(self, model_tasks: dict[str, Any] | None = None, omit_texts: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        model_tasks: dict[str, Any] | None = None,
+        omit_texts: set[str] | None = None,
+        available_result: dict[str, Any] | list[str] | None = None,
+    ) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.available_calls = 0
         self.model_tasks = model_tasks or {}
         self.omit_texts = omit_texts or set()
+        self.available_result = available_result
 
     async def embed(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(dict(kwargs))
@@ -21,15 +29,20 @@ class FakeEmbedding:
         returned = [text for text in texts if text not in self.omit_texts]
         return {"success": True, "results": [{"embedding": [1.0, 0.0]} for _ in returned]}
 
-    async def get_available_models(self) -> dict[str, Any]:
+    async def get_available_models(self) -> dict[str, Any] | list[str]:
+        self.available_calls += 1
+        if self.available_result is not None:
+            return self.available_result
         return {"success": True, "models": list(self.model_tasks)}
 
 
 class FakeConfig:
     def __init__(self, model_tasks: dict[str, Any] | None = None) -> None:
+        self.calls: list[tuple[str, Any]] = []
         self.model_tasks = model_tasks or {}
 
     async def get(self, key: str, default: Any = None) -> Any:
+        self.calls.append((key, default))
         if key == "model_task_config":
             return {"model_task_config": self.model_tasks}
         return default
@@ -49,9 +62,6 @@ def load_plugin(model_tasks: dict[str, Any] | None = None):
     config = FakeConfig(model_tasks)
     plugin._ctx = type("FakeContext", (), {"llm": embedding, "config": config})()
     plugin._embedding = embedding
-    # 单元测试不能触发 NapCat Adapter 真实配置同步；否则会把测试名单写进生产配置。
-    plugin._next_adapter_sync_check = float("inf")
-    # 单元测试不读取部署机真实 model_config.toml，保证来源分支可复现。
     plugin._host_model_tasks = dict(model_tasks or {})
     plugin._embedding_config_refreshed_at = time.monotonic()
     return plugin
@@ -86,6 +96,73 @@ def bot_message(message_id: str, text: str, target_user: str = "") -> dict[str, 
 def resolve(plugin, current: dict[str, Any]) -> dict[str, Any]:
     metadata = plugin._extract_dialogue_metadata(current)
     return asyncio.run(plugin._resolve_dialogue_target(current["session_id"], current, metadata))
+
+
+def test_host_model_tasks_are_loaded_through_sdk_capabilities() -> None:
+    plugin = load_plugin({"embedding": {"model_list": ["Embed-A"]}})
+    plugin._host_model_tasks = {}
+    plugin._host_model_tasks_fallback = False
+
+    asyncio.run(plugin._refresh_host_embedding_config())
+
+    assert plugin._ctx.config.calls == [("model_task_config", None)]
+    assert plugin._embedding.available_calls == 0
+    assert plugin._host_model_tasks["embedding"]["model_list"] == ["Embed-A"]
+    assert plugin._effective_embedding_task() == "embedding"
+
+
+def test_available_models_capability_is_used_when_config_get_has_no_binding() -> None:
+    plugin = load_plugin({"embedding": {}})
+    plugin._host_model_tasks = {}
+    plugin._host_model_tasks_fallback = False
+
+    asyncio.run(plugin._refresh_host_embedding_config())
+
+    assert plugin._ctx.config.calls == [("model_task_config", None)]
+    assert plugin._embedding.available_calls == 1
+    assert plugin._host_model_tasks_fallback is True
+    assert plugin._effective_embedding_task() == "embedding"
+    asyncio.run(plugin._embed_dialogue_texts(["同一句话"]))
+    asyncio.run(plugin._embed_dialogue_texts(["同一句话"]))
+    assert len(plugin._embedding.calls) == 2
+    assert plugin._embedding_cache == {}
+
+
+def test_available_models_capability_supports_sdk_list_result() -> None:
+    plugin = load_plugin()
+    embedding = FakeEmbedding(available_result=["embedding"])
+    plugin._embedding = embedding
+    plugin._ctx.llm = embedding
+    plugin._host_model_tasks = {}
+    plugin._host_model_tasks_fallback = False
+
+    asyncio.run(plugin._refresh_host_embedding_config())
+
+    assert embedding.available_calls == 1
+    assert plugin._host_model_tasks_fallback is True
+    assert plugin._effective_embedding_task() == "embedding"
+
+
+def test_plugin_does_not_cross_host_or_plugin_file_boundaries() -> None:
+    plugin = load_plugin()
+    root = Path(__file__).resolve().parents[1]
+    text = (root / "plugin.py").read_text(encoding="utf-8")
+    metadata = json.loads((root / "_manifest.json").read_text(encoding="utf-8"))
+
+    for banned in (
+        "_read_host_model_tasks_file",
+        "_find_adapter_config_path",
+        "_sync_adapter_access_config",
+        "manage_adapter",
+        "model_config.toml",
+        "parents[2]",
+        "os.replace",
+        "shutil.copy",
+    ):
+        assert banned not in text
+    assert not hasattr(plugin.config.access, "manage_adapter")
+    assert not hasattr(plugin.config.access, "adapter_plugin_id")
+    assert metadata["dependencies"] == []
 
 
 def test_different_user_can_follow_up_bot() -> None:

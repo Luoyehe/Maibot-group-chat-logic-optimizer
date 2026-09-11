@@ -5,9 +5,10 @@
 
 设计原则：
 1. 不直接 import src.*，不修改宿主进程对象；
-2. Planner 输出在执行前统一校正，wait/reply/send_emoji 的危险调用不会进入宿主；
-3. reply 成功后追加一个隐藏的 finish 工具，让宿主原生 stop_after_execution 结束本轮；
-4. 发送前再做目标去重、文本去重、表情包冷却和引用频率兜底。
+2. 不读取或写入宿主文件，也不修改其他插件配置；所有跨边界数据均走 SDK capability；
+3. Planner 输出在执行前统一校正，wait/reply/send_emoji 的危险调用不会进入宿主；
+4. reply 成功后追加一个隐藏的 finish 工具，让宿主原生 stop_after_execution 结束本轮；
+5. 发送前再做目标去重、文本去重、表情包冷却和引用频率兜底。
 """
 
 from __future__ import annotations
@@ -16,16 +17,12 @@ import asyncio
 import hashlib
 import json
 import math
-import os
 import re
-import shutil
-import stat
 import time
 import uuid
 from collections import OrderedDict, deque
 from copy import deepcopy
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from maibot_sdk import Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
@@ -57,7 +54,7 @@ class PluginSwitchConfig(PluginConfigBase):
     __ui_icon__ = "shield-check"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用群聊逻辑优化")
-    config_version: str = Field(default="2.0.2", description="配置版本")
+    config_version: str = Field(default="2.0.3", description="配置版本")
 
 
 class LatencyConfig(PluginConfigBase):
@@ -218,15 +215,6 @@ class AccessControlConfig(PluginConfigBase):
         default_factory=list,
         description="私聊QQ列表。whitelist 时是允许列表；blacklist 时是拒绝列表；all 时忽略",
     )
-    manage_adapter: bool = Field(
-        default=True,
-        description="由插件自动把访问模式同步到 NapCat Adapter；同步后适配器保留同名单作为插件故障时的安全兜底",
-    )
-    adapter_plugin_id: str = Field(
-        default="maibot-team.napcat-adapter",
-        description="要同步的 NapCat Adapter 插件ID",
-    )
-
     @staticmethod
     def _normalize_mode(value: str, fallback: str = "whitelist") -> str:
         normalized = str(value or "").strip().lower()
@@ -285,8 +273,6 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         self._reply_total: Dict[str, int] = {}
         self._explicit_bot_target_ids: set[Tuple[str, str]] = set()
         self._whitelist_logged: set[Tuple[str, str]] = set()
-        self._adapter_sync_warned = False
-        self._next_adapter_sync_check = 0.0
         self._host_bot_aliases: List[str] = []
         self._host_bot_user_id = ""
         self._host_alias_refreshed_at: float = 0.0
@@ -296,16 +282,12 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         self._safe_log("info", "群聊逻辑优化已加载：指向判断（自动Embedding/纯规则降级）/Hook调度/回复安全/自然语气/视觉桥接/防刷屏启用")
         await self._refresh_host_bot_aliases()
         await self._refresh_host_embedding_config()
-        # 启动时把插件名单同步到适配器。适配器在插件故障时仍保留同名单作为安全兜底。
-        self._sync_adapter_access_config()
-        self._next_adapter_sync_check = time.monotonic() + 60.0
 
     async def on_unload(self) -> None:
-        # 不恢复全量入站；适配器中最后一次同步的名单就是安全回退配置。
-        self._safe_log("info", "群聊逻辑优化已卸载；适配器保留最后一次同步的访问名单")
+        self._safe_log("info", "群聊逻辑优化已卸载")
 
     async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
-        """配置热更新：self 同步适配器；bot 同步昵称；model 同步 Embedding。"""
+        """配置热更新：bot 同步昵称；model 同步 Embedding。self 重置插件内缓存。"""
 
         del version
         normalized_scope = str(scope or "").strip().lower()
@@ -320,8 +302,6 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             self._embedding_error_until = 0.0
             self._embedding_source_warned = False
             self._embedding_cache.clear()
-            self._sync_adapter_access_config()
-            self._next_adapter_sync_check = time.monotonic() + 60.0
 
     def _safe_log(self, level: str, message: str) -> None:
         try:
@@ -437,24 +417,49 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             self._host_model_tasks_fallback = False
         else:
             try:
-                raw_tasks = self._read_host_model_tasks_file()
+                result = await asyncio.wait_for(
+                    self.ctx.config.get("model_task_config", None),
+                    timeout=max(0.2, float(self.config.target_resolver.embedding_timeout_seconds)),
+                )
+                raw_tasks = self._unwrap_config_value(result)
                 self._host_model_tasks_fallback = False
-                if not raw_tasks:
+            except Exception as exc:
+                raw_tasks = {}
+                self._host_model_tasks_fallback = False
+                if not self._embedding_source_warned:
+                    self._embedding_source_warned = True
+                    self._safe_log("warning", f"群聊逻辑优化：读取宿主模型任务配置失败，将尝试使用能力接口探测: {exc}")
+
+            # config.get 只能提供部分宿主配置视图；当它没有返回模型任务绑定时，
+            # 使用官方 llm.get_available_models capability 探测任务名。该接口虽然
+            # 不返回模型绑定详情，但足以判断 embedding 任务是否存在。
+            known_tasks = self._normalize_model_tasks(raw_tasks)
+            has_model_binding = any(
+                [str(item or "").strip() for item in task_config.get("model_list", []) if str(item or "").strip()]
+                for task_config in known_tasks.values()
+            )
+            if not has_model_binding:
+                try:
                     payload = self._unwrap_config_value(
                         await asyncio.wait_for(
                             self.ctx.llm.get_available_models(),
                             timeout=max(0.2, float(self.config.target_resolver.embedding_timeout_seconds)),
                         )
                     )
-                    task_names = payload.get("models", []) if isinstance(payload, dict) else []
+                    if isinstance(payload, list):
+                        task_names = payload
+                    elif isinstance(payload, dict):
+                        task_names = payload.get("models", [])
+                    else:
+                        task_names = []
                     raw_tasks = {str(name or "").strip(): {} for name in task_names or [] if str(name or "").strip()}
                     self._host_model_tasks_fallback = bool(raw_tasks)
-            except Exception as exc:
-                raw_tasks = {}
-                self._host_model_tasks_fallback = False
-                if not self._embedding_source_warned:
-                    self._embedding_source_warned = True
-                    self._safe_log("warning", f"群聊逻辑优化：读取宿主 Embedding 配置失败，将使用纯规则判断: {exc}")
+                except Exception as exc:
+                    raw_tasks = {}
+                    self._host_model_tasks_fallback = False
+                    if not self._embedding_source_warned:
+                        self._embedding_source_warned = True
+                        self._safe_log("warning", f"群聊逻辑优化：读取宿主 Embedding 配置失败，将使用纯规则判断: {exc}")
 
         new_model_tasks = self._normalize_model_tasks(raw_tasks)
         previous_host_models = [
@@ -474,6 +479,10 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         ).hexdigest()
         if self._host_model_binding_fingerprint and binding_fingerprint != self._host_model_binding_fingerprint:
             # 同名任务更换模型时必须弃用旧向量，避免不同 Embedding 空间混算余弦。
+            self._embedding_cache.clear()
+        if self._host_model_tasks_fallback:
+            # get_available_models 只暴露任务名，无法感知同名任务背后的模型更换；
+            # 此时禁用向量缓存，避免不同 Embedding 空间的旧向量混入。
             self._embedding_cache.clear()
         self._host_model_tasks = new_model_tasks
         self._host_model_binding_fingerprint = binding_fingerprint
@@ -504,25 +513,6 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         ):
             return
         await self._refresh_host_embedding_config()
-
-    @staticmethod
-    def _read_host_model_tasks_file() -> Dict[str, Dict[str, Any]]:
-        """读取标准 model_config.toml 中的任务/模型绑定，供模型名反查任务名。"""
-
-        try:
-            import tomllib
-
-            config_path = Path(__file__).resolve().parents[2] / "config" / "model_config.toml"
-            with config_path.open("rb") as file:
-                data = tomllib.load(file)
-            raw_tasks = data.get("model_task_config", data)
-            return {
-                task_name: dict(task_config)
-                for task_name, task_config in raw_tasks.items()
-                if isinstance(task_name, str) and isinstance(task_config, dict)
-            }
-        except Exception:
-            return {}
 
     @staticmethod
     def _normalize_embedding_source(value: str) -> str:
@@ -577,106 +567,6 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             return bool(self.config.plugin.enabled)
         except Exception:
             return True
-
-    def _find_adapter_config_path(self) -> Optional[Path]:
-        """按 manifest ID 查找 NapCat Adapter 配置，避免硬编码插件目录名。"""
-
-        try:
-            configured_id = str(self.config.access.adapter_plugin_id or "").strip()
-            root = Path(__file__).resolve().parents[2]
-            for manifest_path in (root / "plugins").glob("*/_manifest.json"):
-                try:
-                    manifest = __import__("json").loads(manifest_path.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                if str(manifest.get("id", "") or "").strip() == configured_id:
-                    candidate = manifest_path.parent / "config.toml"
-                    if candidate.is_file():
-                        return candidate
-        except Exception as exc:
-            self._safe_log("warning", f"群聊逻辑优化：查找 NapCat Adapter 失败: {exc}")
-        return None
-
-    def _sync_adapter_access_config(self) -> bool:
-        """把插件访问控制同步为适配器前置过滤配置。
-
-        官方 MaiBot SDK 目前只允许内置插件管理器修改其它插件配置；这里用确定性的
-        manifest 查找 + TOML 原地更新实现插件内同步。适配器配置始终保留插件名单，
-        因此插件崩溃/卸载时不会退回危险的“无名单全量入站”。
-        """
-
-        try:
-            if not self._enabled() or not self.config.access.enabled or not self.config.access.manage_adapter:
-                return False
-            config_path = self._find_adapter_config_path()
-            if config_path is None:
-                if not self._adapter_sync_warned:
-                    self._adapter_sync_warned = True
-                    self._safe_log("warning", "群聊逻辑优化：未找到 NapCat Adapter，无法自动同步访问名单")
-                return False
-
-            import tomlkit
-
-            raw = config_path.read_text(encoding="utf-8")
-            document = tomlkit.parse(raw)
-            chat = document.setdefault("chat", tomlkit.table())
-            group_mode = AccessControlConfig._normalize_mode(self.config.access.group_mode)
-            user_mode = AccessControlConfig._normalize_mode(self.config.access.user_mode)
-
-            # 仅当群聊和私聊都选择 all 时才关闭适配器名单；
-            # 任一维度仍受限时，适配器必须开启自己的前置过滤。
-            chat["enable_chat_list_filter"] = not (group_mode == "all" and user_mode == "all")
-            chat["show_dropped_chat_list_messages"] = False
-
-            if group_mode == "whitelist":
-                chat["group_list_type"] = "whitelist"
-                chat["group_list"] = list(self._id_set(self.config.access.group_list))
-            elif group_mode == "blacklist":
-                chat["group_list_type"] = "blacklist"
-                chat["group_list"] = list(self._id_set(self.config.access.group_list))
-            else:
-                # 适配器维度全量：空黑名单等价于全部放行。
-                chat["group_list_type"] = "blacklist"
-                chat["group_list"] = []
-
-            if user_mode == "whitelist":
-                chat["private_list_type"] = "whitelist"
-                chat["private_list"] = list(self._id_set(self.config.access.user_list))
-            elif user_mode == "blacklist":
-                chat["private_list_type"] = "blacklist"
-                chat["private_list"] = list(self._id_set(self.config.access.user_list))
-            else:
-                chat["private_list_type"] = "blacklist"
-                chat["private_list"] = []
-
-            new_raw = tomlkit.dumps(document)
-            if new_raw == raw:
-                self._adapter_sync_warned = False
-                return True
-
-            # 原子写入，并保留原配置权限。
-            backup_dir = Path(__file__).resolve().parents[2] / "data" / "plugins" / "local.group-chat-logic-optimizer" / "adapter-sync-backups"
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            backup_path = backup_dir / f"adapter-config-{datetime.now().strftime('%Y%m%d%H%M%S%f')}.toml"
-            shutil.copy2(config_path, backup_path)
-            backups = sorted(backup_dir.glob("adapter-config-*.toml"))
-            for old_backup in backups[:-10]:
-                old_backup.unlink(missing_ok=True)
-
-            temporary_path = config_path.with_name(config_path.name + ".group-logic.tmp")
-            temporary_path.write_text(new_raw, encoding="utf-8")
-            os.chmod(temporary_path, stat.S_IMODE(config_path.stat().st_mode))
-            os.replace(temporary_path, config_path)
-            self._adapter_sync_warned = False
-            self._safe_log(
-                "info",
-                "群聊逻辑优化：已同步 NapCat Adapter 前置访问配置 "
-                f"group={group_mode}, user={user_mode}, config={config_path}",
-            )
-            return True
-        except Exception as exc:
-            self._safe_log("warning", f"群聊逻辑优化：同步 NapCat Adapter 配置失败: {exc}")
-            return False
 
     @staticmethod
     def _id_set(values: list[str]) -> set[str]:
@@ -868,9 +758,10 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         cache_ttl = max(int(cfg.window_seconds), int(self.config.followup.window_seconds)) + 60.0
         vectors: Dict[str, List[float]] = {}
         missing: List[str] = []
+        cache_enabled = not self._host_model_tasks_fallback
         for normalized in normalized_values:
             key = hashlib.sha256(f"{embedding_task}\0{normalized}".encode("utf-8")).hexdigest()
-            cached = self._embedding_cache.get(key)
+            cached = self._embedding_cache.get(key) if cache_enabled else None
             if cached is not None and now - cached[0] <= cache_ttl:
                 self._embedding_cache.move_to_end(key)
                 for original, original_normalized in input_pairs:
@@ -908,8 +799,9 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                     continue
                 new_vectors[text] = vector
                 key = hashlib.sha256(f"{embedding_task}\0{text}".encode("utf-8")).hexdigest()
-                self._embedding_cache[key] = (now, vector)
-                self._embedding_cache.move_to_end(key)
+                if cache_enabled:
+                    self._embedding_cache[key] = (now, vector)
+                    self._embedding_cache.move_to_end(key)
             if len(new_vectors) != len(missing):
                 raise RuntimeError("embedding result contains empty or invalid vectors")
             for original, normalized in input_pairs:
@@ -1550,9 +1442,6 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                 and now - self._host_alias_refreshed_at > 60.0
             ):
                 await self._refresh_host_bot_aliases()
-            if self.config.access.manage_adapter and now >= self._next_adapter_sync_check:
-                self._sync_adapter_access_config()
-                self._next_adapter_sync_check = now + 60.0
         except Exception:
             pass
         self._evict_session_state()
@@ -2361,15 +2250,6 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         if not isinstance(message, dict):
             # 无法识别消息时保持放行，交给后续安全规则；全量/名单模式仍可正常处理常规消息。
             return {"action": "continue", "modified_kwargs": {}}
-
-        # 允许消息到达插件时，周期性自愈适配器配置漂移；修改自身配置时会立即同步。
-        try:
-            now = time.monotonic()
-            if self.config.access.manage_adapter and now >= self._next_adapter_sync_check:
-                self._sync_adapter_access_config()
-                self._next_adapter_sync_check = now + 60.0
-        except Exception:
-            pass
 
         try:
             now = time.monotonic()

@@ -33,7 +33,7 @@ git clone https://github.com/Luoyehe/Maibot-group-chat-logic-optimizer.git group
 - 自然语气：短回复、反机械开头、反文艺腔、反重复，并可触发一次重写。
 - 引用人性化：默认每 4 条可见回复最多 1 条 QQ 引用。
 - 表情包冷却：同会话默认 600 秒。
-- 插件级白名单：群/私聊双白名单兜底。
+- 插件级白名单：群/私聊双白名单在消息入站早期兜底。
 - Embedding + 对话状态指向判断：区分当前消息是对机器人、某个群友还是对整个群说；未配置 Embedding 时自动使用纯规则对话状态判断；命中机器人时只送入 Planner，不代 planner 生成回复。
 
 ## 不覆盖范围
@@ -61,24 +61,16 @@ user_list = ["10000"]
 
 拦截发生在 `chat.receive.before_process`，早于媒体处理、会话注册、记忆写入和 Planner。
 
-## 自动同步 NapCat Adapter
+## NapCat Adapter 边界说明
 
-默认：
+本插件从 2.0.3 起不再读取或修改 NapCat Adapter 的 `config.toml`：
 
-```toml
-[access]
-manage_adapter = true
-adapter_plugin_id = "maibot-team.napcat-adapter"
-```
+- `[access]` 只作为本插件的消息入站治理配置；
+- 适配器自身名单、连接与登录仍由适配器或宿主插件管理器维护；
+- 如需适配器层前置过滤，请按适配器自己的文档配置；
+- 插件不会因为配置同步而写其他插件目录、备份数据或清理历史配置。
 
-插件加载或自身配置热更新时，会自动把 `[access]` 同步到 NapCat Adapter：
-
-- 群/私聊 `whitelist` → 适配器同名 whitelist；
-- 群/私聊 `blacklist` → 适配器同名 blacklist；
-- 单个维度 `all` → 该维度空黑名单；
-- 群聊和私聊都是 `all` → `enable_chat_list_filter=false`。
-
-适配器中同步出的名单是插件故障时的安全兜底；插件卸载或崩溃时不会回退成无名单全量入站。
+这是为了遵守 MaiBot Plugin SDK 的权限边界，避免普通插件越权改写其他插件配置。
 
 ## 原版 MaiBot 最小部署结论
 
@@ -97,7 +89,7 @@ adapter_plugin_id = "maibot-team.napcat-adapter"
    - `[context].max_history_messages` 插件保留的聊天上下文条数，默认30。
 4. 重启 MaiBot。
 
-插件会自动注入 Planner/Replyer 规则、同步 NapCat Adapter 名单、裁剪聊天上下文、抑制 wait 空转、处理 reply 去重、引用频率、表情包冷却、自然语气、技术证据边界和图片信息桥接。
+插件会自动注入 Planner/Replyer 规则、裁剪聊天上下文、抑制 wait 空转、处理 reply 去重、引用频率、表情包冷却、自然语气、技术证据边界和图片信息桥接。访问控制只作用于本插件入站 Hook，不修改 NapCat Adapter 配置。
 
 模型服务本身、vLLM/llama.cpp 参数、NapCat 登录、WebUI/TLS、Embedding 服务和向量池重建仍属于部署配置，不属于聊天逻辑插件能力范围。
 
@@ -108,7 +100,7 @@ adapter_plugin_id = "maibot-team.napcat-adapter"
 ## 配置项概览
 
 - `[plugin]`：插件启停与配置版本。
-- `[access]`：群聊/私聊访问模式、名单、是否自动同步 NapCat Adapter。
+- `[access]`：群聊/私聊访问模式与名单。
 - `[mentions]`：机器人昵称；留空时自动继承宿主昵称。
 - `[context]`、`[followup]`：上下文长度和连续对话保护。
 - `[target_resolver]`：Embedding 来源、超时、降级与指向判断阈值。
@@ -126,14 +118,10 @@ adapter_plugin_id = "maibot-team.napcat-adapter"
 Manifest 声明的能力：
 
 - `config.get`：读取宿主机器人昵称、账号和模型任务配置。
-- `llm.get_available_models`：在标准配置文件不可读取时探测宿主模型任务。
+- `llm.get_available_models`：在 `config.get` 未暴露模型任务绑定时探测宿主可用模型任务。
 - `llm.embed`：调用宿主 Embedding 任务辅助判断群聊受话对象。
 
-运行时依赖：
-
-- `tomlkit`：同步 NapCat Adapter 配置时保留 TOML 结构与注释。
-
-本插件不需要网络直连能力、数据库能力或发送消息能力；发送侧只通过宿主 Hook 处理既有消息。
+本插件没有额外 Python 包依赖，不需要网络直连能力、数据库能力、文件写入能力或发送消息能力；发送侧只通过宿主 Hook 处理既有消息，模型与宿主配置只通过 SDK capability 读取。
 
 ## 宿主昵称自动同步
 
@@ -165,7 +153,7 @@ alias_names = ["别名1", "别名2"]
 
 Embedding 来源默认为 `auto`：
 
-1. 插件 `[target_resolver].task_name` 非空时，优先使用该模型任务/模型名作为覆盖；
+1. 插件 `[target_resolver].task_name` 非空时，优先使用该模型任务作为覆盖；
 2. 插件未覆盖时，沿用 MaiBot 宿主的 `[model_task_config.embedding]`；
 3. 两者都未配置时，不发起 Embedding 请求，自动降级为纯规则对话状态判断；
 4. Embedding 请求失败或超时后，同样临时回退纯规则判断。
@@ -175,7 +163,7 @@ Embedding 来源默认为 `auto`：
 ```toml
 [target_resolver]
 embedding_source = "auto"     # auto / host / plugin / disabled
-task_name = ""                # 留空沿用宿主；也可填宿主模型任务名或模型名
+task_name = ""                # 留空沿用宿主；建议填宿主模型任务名
 use_embedding = true          # false 时始终禁用语义向量
 ```
 
@@ -184,7 +172,7 @@ use_embedding = true          # false 时始终禁用语义向量
 - `plugin`：只使用插件覆盖的 `task_name`；
 - `disabled`：始终纯规则判断。
 
-Embedding 请求通过 MaiBot 官方 `llm.embed` capability 调用宿主模型任务。默认批量请求、1.5 秒超时、30 秒失败冷却、300 秒配置探测间隔和 768 条 LRU 向量缓存。
+模型任务配置通过 `config.get` 读取；若当前宿主没有通过该能力暴露模型任务绑定，则用 `llm.get_available_models` 探测任务名。Embedding 请求通过 MaiBot 官方 `llm.embed` capability 调用宿主模型任务。默认批量请求、1.5 秒超时、30 秒失败冷却、300 秒配置探测间隔和 768 条 LRU 向量缓存。
 
 纯规则降级仍会使用确定性 `@`/引用信号、机器人上一轮、插话链、第二人称/疑问行为和混合文本重合率；只是不再计算语义余弦相似度。日志中的 `method=rule` 即表示本条判断没有调用 Embedding。
 
@@ -252,7 +240,7 @@ require_planner_intent_for_history = true
    - 确认 `[plugin].enabled = true`。
 3. **消息被拦截**
    - 检查 `[access]` 群/私聊模式和名单。
-   - 若启用 `manage_adapter`，同时查看 NapCat Adapter 配置是否被同步。
+   - 本插件不会修改 NapCat Adapter；如需适配器层过滤，请查看适配器自身配置。
 4. **指向判断一直 `method=rule`**
    - 检查宿主 `[model_task_config.embedding]` 或插件 `[target_resolver].task_name`。
    - Embedding 超时后会临时降级，等待冷却后自动重试。
