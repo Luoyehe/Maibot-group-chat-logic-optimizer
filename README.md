@@ -2,12 +2,25 @@
 
 面向 MaiBot 1.2.x / SDK 2.x 的群聊治理插件。
 
+仓库：<https://github.com/Luoyehe/Maibot-group-chat-logic-optimizer>
+
+问题反馈：<https://github.com/Luoyehe/Maibot-group-chat-logic-optimizer/issues>
+
 ## 安装与启用
 
-1. 将本目录复制或解压到 MaiBot 的 `plugins/group_chat_logic_optimizer/`。
-2. 重启 MaiBot；Runner 会根据 `plugin.py` 中的 `config_model` 生成本实例的 `config.toml`。
-3. 在 WebUI 的“插件管理”中确认“群聊逻辑优化”已出现并启用。
-4. 按需修改 `[access]`、`[mentions]`、`[target_resolver]` 等配置后保存，插件会热更新。
+推荐直接克隆到 MaiBot 的插件目录：
+
+```bash
+cd /path/to/MaiBot/plugins
+git clone https://github.com/Luoyehe/Maibot-group-chat-logic-optimizer.git group_chat_logic_optimizer
+```
+
+随后：
+
+1. 重启 MaiBot；Runner 会根据 `plugin.py` 中的 `config_model` 生成本实例的 `config.toml`。
+2. 在 WebUI 的“插件管理”中确认“群聊逻辑优化”已出现并启用。
+3. 按需修改 `[access]`、`[mentions]`、`[target_resolver]` 等配置后保存，插件会热更新。
+4. 更新时进入插件目录执行 `git pull`，然后在 WebUI 重载插件或重启 MaiBot。
 
 源码包不应携带本地 `config.toml`、日志、缓存、数据库或历史备份。插件目录内提供 `.gitignore`，运行时配置由 Runner 生成。
 

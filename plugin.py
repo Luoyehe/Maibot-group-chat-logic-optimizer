@@ -57,7 +57,7 @@ class PluginSwitchConfig(PluginConfigBase):
     __ui_icon__ = "shield-check"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用群聊逻辑优化")
-    config_version: str = Field(default="2.0.1", description="配置版本")
+    config_version: str = Field(default="2.0.2", description="配置版本")
 
 
 class LatencyConfig(PluginConfigBase):
