@@ -1,7 +1,7 @@
 """群聊逻辑优化插件。
 
 通过 MaiBot 2.x Hook 机制，把本轮部署中验证过的群聊调度、回复安全、
-自然语气、多模态信息桥接和防刷屏规则做成可迁移插件。
+输出卫生、多模态信息桥接和防刷屏规则做成可迁移插件。
 
 设计原则：
 1. 不直接 import src.*，不修改宿主进程对象；
@@ -42,11 +42,6 @@ _SPECULATIVE_PATTERNS = (
 )
 _EVIDENCE_RELAX_PATTERNS = ("不确定", "无法确定", "看不出", "待确认", "没有证据", "证据不足")
 _BANNED_OPENERS = ("嗯", "好", "知道了", "确实", "对啊", "哈哈", "那", "这")
-_LITERARY_WORDS = ("惬意", "治愈", "氛围感", "松弛感", "温柔了岁月", "人间值得")
-_HARSH_PATTERNS = (
-    "瞎猜啥", "别瞎猜", "不认账", "眼神不太行", "管什么管", "谁自作多情",
-    "闭嘴", "烦不烦", "你才", "你不配", "活该", "滚吧",
-)
 
 
 class PluginSwitchConfig(PluginConfigBase):
@@ -54,7 +49,7 @@ class PluginSwitchConfig(PluginConfigBase):
     __ui_icon__ = "shield-check"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用群聊逻辑优化")
-    config_version: str = Field(default="2.0.3", description="配置版本")
+    config_version: str = Field(default="2.0.4", description="配置版本")
 
 
 class LatencyConfig(PluginConfigBase):
@@ -103,10 +98,13 @@ class ReplyFallbackConfig(PluginConfigBase):
 
 
 class StyleConfig(PluginConfigBase):
-    __ui_label__ = "自然语气"
+    __ui_label__ = "输出卫生"
     __ui_icon__ = "message-circle"
     __ui_order__ = 5
-    natural_style: bool = Field(default=True, description="注入自然QQ群友语气规则")
+    natural_style: bool = Field(
+        default=True,
+        description="注入通用输出卫生规则；不指定人格、性格、语气或特定回复风格",
+    )
     avoid_recent_reply_count: int = Field(default=5, ge=0, le=20, description="注入近期回复以避免重复句式")
 
 
@@ -280,7 +278,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         self._host_alias_warned = False
 
     async def on_load(self) -> None:
-        self._safe_log("info", "群聊逻辑优化已加载：指向判断（自动Embedding/纯规则降级）/Hook调度/回复安全/自然语气/视觉桥接/防刷屏启用")
+        self._safe_log("info", "群聊逻辑优化已加载：指向判断（自动Embedding/纯规则降级）/Hook调度/回复安全/输出卫生/视觉桥接/防刷屏启用")
         await self._refresh_host_bot_aliases()
         await self._refresh_host_embedding_config()
 
@@ -1938,15 +1936,12 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         lines: list[str] = []
         if self.config.style.natural_style:
             lines.append(
-                "# 温柔可爱语气\n"
-                "- 通常8到45字，最多58字；像熟悉的QQ群友，语气温柔、软乎乎、轻快、俏皮，有共感，不像客服、讲师或散文作者。\n"
-                "- 先接住对方的具体内容或情绪，再给看法；可爱来自反应快、愿意理解人、措辞柔软和一点点轻盈调皮，禁止固定口癖或拟声词。\n"
-                "- 可以轻轻调侃、自嘲或顺势接梗，但不反击、不贬低、不嘲讽、不硬杠、不命令对方；被调侃时用软软的幽默化解。\n"
-                "- 对方抱怨、疲惫、委屈或被催时，先自然承认感受，再给一句实际陪伴、选择或小建议；不说教、不空洞安慰。\n"
-                "- 禁止以对方名字、昵称、群名片、称呼或敬称开头；直接说内容，像正常群友一样。\n"
+                "# 输出卫生\n"
+                "- 人设、性格、语气、称呼习惯和回复风格完全遵循宿主 MaiBot 配置；本插件不指定任何特定风格。\n"
+                "- 群聊回复通常8到45字，最多58字；用当前人格自然表达。\n"
+                "- 禁止以对方名字、昵称、群名片、称呼或敬称开头；直接说内容。\n"
                 "- 禁止以“嗯/好/知道了/确实/对啊/哈哈/那/这”开头；不要重复近期回复的开头和句式。\n"
-                "- 约四条最多一条反问；不用比喻、排比、诗意画面、网络金句和大词；不编造作品、数字、报价、经历或当前状态。\n"
-                "- 技术回答先守事实和证据边界，不能为了俏皮弱化不确定性。"
+                "- 不编造作品、数字、报价、经历或当前状态。"
             )
         if self.config.technical.enabled:
             lines.append(
@@ -1968,8 +1963,8 @@ class GroupChatLogicPlugin(MaiBotPlugin):
 
     @HookHandler(
         "maisaka.replyer.before_request",
-        name="replyer_style_guard",
-        description="注入自然语气、反重复、技术不确定性和图片信息边界",
+        name="replyer_input_hygiene_guard",
+        description="注入输出卫生、反重复、技术不确定性和图片信息边界",
         mode=HookMode.BLOCKING,
         order=HookOrder.EARLY,
         error_policy=ErrorPolicy.SKIP,
@@ -2036,9 +2031,6 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             return "回复为空"
         state = self._find_target_state(session_id, reply_message_id)
         technical = bool(state and state.get("technical"))
-        # 用户要求俏皮只体现在语气上，不使用猫称/拟声后缀。
-        if chr(0x55B5) in response:
-            return "不要使用猫称或拟声后缀，请用措辞和节奏表现俏皮"
         if technical:
             has_speculation = any(pattern in response for pattern in _SPECULATIVE_PATTERNS)
             has_relax = any(pattern in response for pattern in _EVIDENCE_RELAX_PATTERNS)
@@ -2046,11 +2038,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                 return "技术回复包含未经验证根因，请改为不确定并索要日志/截图/官方状态"
         if self.config.style.natural_style:
             if any(response.lstrip().startswith(opener) for opener in _BANNED_OPENERS):
-                return "回复开头机械，请换自然群友表达"
-            if any(word in response for word in _LITERARY_WORDS):
-                return "回复过于文艺，请改成普通QQ口语"
-            if any(pattern in response for pattern in _HARSH_PATTERNS):
-                return "回复语气太冲，请改成温柔、共感、不反击的自然说法"
+                return "回复开头机械，请按宿主人设换自然表达"
             if len(text) > int(self.config.reply_safety.max_reply_chars_for_retry):
                 return f"回复超过{self.config.reply_safety.max_reply_chars_for_retry}字，请缩短成群聊短句"
         cooldown = int(self.config.reply_safety.duplicate_text_cooldown_seconds)

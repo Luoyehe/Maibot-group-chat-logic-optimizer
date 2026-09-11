@@ -536,20 +536,18 @@ def test_technical_guess_is_not_excused_by_asking_for_logs() -> None:
     assert "未经验证根因" in reason
 
 
-def test_soft_tone_guard_rejects_aggressive_response() -> None:
+def test_output_guard_does_not_override_host_tone() -> None:
     plugin = load_plugin()
-    reason = plugin._need_replyer_retry("group:test", "u1", "瞎猜啥，我可不认账")
-    assert reason is not None
-    assert "语气太冲" in reason
+    reason = plugin._need_replyer_retry("group:test", "u1", "瞎猜啥，我可不认账喵")
+    assert reason is None
 
 
-def test_soft_tone_policy_prioritizes_empathy() -> None:
+def test_output_policy_delegates_style_to_host_configuration() -> None:
     plugin = load_plugin()
     policy = plugin._replyer_policy("group:test", "u1")
-    assert "温柔" in policy
-    assert "共感" in policy
-    assert "不反击" in policy
-    assert "不嘲讽" in policy
+    assert "完全遵循宿主 MaiBot 配置" in policy
+    for forbidden in ("温柔", "俏皮", "可爱", "软乎乎"):
+        assert forbidden not in policy
 
 
 def test_at_other_user_is_deterministic() -> None:
