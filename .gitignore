@@ -1,9 +1,0 @@
-/config.toml
-/config_back/
-/__pycache__/
-**/__pycache__/
-*.py[cod]
-.pytest_cache/
-.coverage
-htmlcov/
-.venv/
