@@ -262,6 +262,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         self._session_dialogue: Dict[str, Deque[Dict[str, Any]]] = {}
         self._session_group_ids: OrderedDict[str, str] = OrderedDict()
         self._embedding_cache: OrderedDict[str, Tuple[float, List[float]]] = OrderedDict()
+        self._embedding_cache_model = ""
         self._embedding_error_until = 0.0
         self._embedding_warned = False
         self._host_model_tasks: Dict[str, Dict[str, Any]] = {}
@@ -302,6 +303,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             self._embedding_error_until = 0.0
             self._embedding_source_warned = False
             self._embedding_cache.clear()
+            self._embedding_cache_model = ""
 
     def _safe_log(self, level: str, message: str) -> None:
         try:
@@ -480,10 +482,9 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         if self._host_model_binding_fingerprint and binding_fingerprint != self._host_model_binding_fingerprint:
             # 同名任务更换模型时必须弃用旧向量，避免不同 Embedding 空间混算余弦。
             self._embedding_cache.clear()
-        if self._host_model_tasks_fallback:
-            # get_available_models 只暴露任务名，无法感知同名任务背后的模型更换；
-            # 此时禁用向量缓存，避免不同 Embedding 空间的旧向量混入。
-            self._embedding_cache.clear()
+        # 配置探测结果变化后，等待下一次 llm.embed 返回的 model_name 重新校准缓存。
+        self._embedding_cache.clear()
+        self._embedding_cache_model = ""
         self._host_model_tasks = new_model_tasks
         self._host_model_binding_fingerprint = binding_fingerprint
         self._embedding_config_refreshed_at = time.monotonic()
@@ -756,11 +757,15 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             return {}
         now = time.monotonic()
         cache_ttl = max(int(cfg.window_seconds), int(self.config.followup.window_seconds)) + 60.0
+        if self._host_model_tasks_fallback:
+            # 任务名探测无法提前感知同名任务背后的模型更换，短 TTL 保证变化后快速自愈。
+            cache_ttl = min(30.0, cache_ttl)
         vectors: Dict[str, List[float]] = {}
         missing: List[str] = []
-        cache_enabled = not self._host_model_tasks_fallback
+        cache_model = str(self._embedding_cache_model or "").strip()
+        cache_enabled = bool(cache_model)
         for normalized in normalized_values:
-            key = hashlib.sha256(f"{embedding_task}\0{normalized}".encode("utf-8")).hexdigest()
+            key = self._embedding_cache_key(embedding_task, cache_model, normalized)
             cached = self._embedding_cache.get(key) if cache_enabled else None
             if cached is not None and now - cached[0] <= cache_ttl:
                 self._embedding_cache.move_to_end(key)
@@ -785,10 +790,14 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             if not isinstance(results, list) or len(results) != len(missing):
                 raise RuntimeError("embedding batch result count mismatch")
             new_vectors: Dict[str, List[float]] = {}
+            result_model = ""
             for text, result in zip(missing, results, strict=True):
                 if not isinstance(result, dict):
                     continue
                 raw_vector = result.get("embedding")
+                candidate_model = str(result.get("model_name", "") or "").strip()
+                if candidate_model and not result_model:
+                    result_model = candidate_model
                 if not isinstance(raw_vector, list) or not raw_vector:
                     continue
                 try:
@@ -798,7 +807,13 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                 if len(vector) != len(raw_vector) or not all(math.isfinite(value) for value in vector):
                     continue
                 new_vectors[text] = vector
-                key = hashlib.sha256(f"{embedding_task}\0{text}".encode("utf-8")).hexdigest()
+            if result_model and result_model != cache_model:
+                self._embedding_cache.clear()
+                cache_model = result_model
+                self._embedding_cache_model = result_model
+                cache_enabled = True
+            for text, vector in new_vectors.items():
+                key = self._embedding_cache_key(embedding_task, cache_model, text)
                 if cache_enabled:
                     self._embedding_cache[key] = (now, vector)
                     self._embedding_cache.move_to_end(key)
@@ -818,6 +833,10 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         while len(self._embedding_cache) > max(32, int(cfg.cache_size)):
             self._embedding_cache.popitem(last=False)
         return vectors
+
+    @staticmethod
+    def _embedding_cache_key(task_name: str, model_name: str, text: str) -> str:
+        return hashlib.sha256(f"{task_name}\0{model_name}\0{text}".encode("utf-8")).hexdigest()
 
     def _can_safely_mark_message(self, message: Dict[str, Any]) -> bool:
         """只有QQ文本消息才回传修改，避免平台时间戳和RPC大帧问题。"""

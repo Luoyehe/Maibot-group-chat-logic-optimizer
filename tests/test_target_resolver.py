@@ -27,7 +27,10 @@ class FakeEmbedding:
         self.calls.append(dict(kwargs))
         texts = kwargs.get("texts", [])
         returned = [text for text in texts if text not in self.omit_texts]
-        return {"success": True, "results": [{"embedding": [1.0, 0.0]} for _ in returned]}
+        return {
+            "success": True,
+            "results": [{"embedding": [1.0, 0.0], "model_name": "Embed-A"} for _ in returned],
+        }
 
     async def get_available_models(self) -> dict[str, Any] | list[str]:
         self.available_calls += 1
@@ -124,8 +127,9 @@ def test_available_models_capability_is_used_when_config_get_has_no_binding() ->
     assert plugin._effective_embedding_task() == "embedding"
     asyncio.run(plugin._embed_dialogue_texts(["同一句话"]))
     asyncio.run(plugin._embed_dialogue_texts(["同一句话"]))
-    assert len(plugin._embedding.calls) == 2
-    assert plugin._embedding_cache == {}
+    assert len(plugin._embedding.calls) == 1
+    assert len(plugin._embedding_cache) == 1
+    assert plugin._embedding_cache_model == "Embed-A"
 
 
 def test_available_models_capability_supports_sdk_list_result() -> None:
