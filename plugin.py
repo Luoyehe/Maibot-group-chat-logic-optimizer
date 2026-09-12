@@ -31,7 +31,9 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 _MESSAGE_RE = re.compile(r"<message\b(?P<attrs>[^>]*)>\s*(?P<body>.*?)(?:</message>|(?=<message\b)|$)", re.S | re.I)
 _ATTR_RE = re.compile(r"([\w:-]+)\s*=\s*[\"']?([^\"'\s>]+)[\"']?", re.I)
 _URL_RE = re.compile(
-    r"(?:https?://|www\.)\S+|\b[a-z0-9.-]+\.(?:com|net|org|io|dev|ai|edu|gov|me|cc)\b(?:/\S*)?",
+    r"(?:https?://|www\.)[^\s\u4e00-\u9fff<>\"'(),;，。；：？！]+"
+    r"|\b[a-z0-9.-]+\.(?:com|net|org|io|dev|ai|edu|gov|me|cc)\b"
+    r"(?:/[^\s\u4e00-\u9fff<>\"'(),;，。；：？！]*)?",
     re.I,
 )
 _TECH_KEYWORDS = (
@@ -53,7 +55,7 @@ class PluginSwitchConfig(PluginConfigBase):
     __ui_icon__ = "shield-check"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用群聊逻辑优化")
-    config_version: str = Field(default="2.0.5", description="配置版本")
+    config_version: str = Field(default="2.0.6", description="配置版本")
 
 
 class LatencyConfig(PluginConfigBase):
@@ -1555,11 +1557,16 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             return False
 
         max_age = max(10, int(self.config.reply_fallback.max_age_seconds))
+        context_window = max(1, int(self.config.reply_fallback.scan_messages))
+        checked_records = 0
         for _record_id, info in reversed(records):
             if int(info.get("order", -1)) >= target_order:
                 continue
             if self._context_record_is_too_old(info, max_age):
                 continue
+            if checked_records >= context_window:
+                break
+            checked_records += 1
             if self._is_technical(str(info.get("text", "") or "")):
                 return True
         return False
@@ -1810,7 +1817,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             return None, ""
 
         latest_id, latest_info = records[-1]
-        planner_wants_reply = bool(canceled_reply_intent) or self._analysis_requests_reply(output_items)
+        analysis_requests_reply = self._analysis_requests_reply(output_items)
         directed_records = [
             (msg_id, info)
             for msg_id, info in records
@@ -1820,10 +1827,13 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         if self._is_bot_directed_context_target(session_id, latest_id, latest_info):
             target_id, target_info = latest_id, latest_info
         elif directed_records:
-            if self.config.reply_fallback.require_planner_intent_for_history and not planner_wants_reply:
+            if (
+                self.config.reply_fallback.require_planner_intent_for_history
+                and not (analysis_requests_reply or canceled_reply_intent)
+            ):
                 return None, ""
             target_id, target_info = directed_records[-1]
-        elif planner_wants_reply:
+        elif analysis_requests_reply:
             target_id, target_info = latest_id, latest_info
         else:
             return None, ""
@@ -1897,11 +1907,14 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                 new_items.append(self._assistant_note(item, reason))
                 continue
             if name == "reply" and not terminal_seen:
+                reply_args = args if isinstance(args, dict) else {}
+                reply_target = str(reply_args.get("msg_id", "") or "").strip()
+                reply_target_exists = bool(reply_target and reply_target in self._context_cache.get(session_id, {}))
                 normalized, reason = self._normalize_reply_item(session_id, item, args)
                 if normalized is None:
                     # reply 已证明 Planner 有可见回复意图；即目标被安全规则取消，
                     # 也不能直接丢掉本轮意图，应让有界兜底尝试更早的有效目标。
-                    canceled_reply_intent = True
+                    canceled_reply_intent = canceled_reply_intent or reply_target_exists
                     rejected.append(reason)
                     new_items.append(self._assistant_note(item, reason))
                 else:
@@ -2396,11 +2409,6 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                     last_reply["followup_count"] = 0
                 return {"action": "continue", "modified_kwargs": {}}
 
-            # resolver 判定为机器人的消息也进入有界兜底候选。Planner 上下文
-            # 序列化会丢失运行时 is_mentioned 标记，不能只依赖字面 @/昵称。
-            if message_id:
-                self._bot_directed_target_ids.add((session_id, message_id))
-
             try:
                 followup_count = int(last_reply.get("followup_count", 0) or 0) if isinstance(last_reply, dict) else 0
             except (TypeError, ValueError):
@@ -2422,6 +2430,11 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                 except (TypeError, ValueError):
                     last_reply["followup_count"] = 1
                 last_reply["resolver_last_at"] = time.monotonic()
+
+            # 只有真正通过追问限流并触发 Planner 的 resolver 目标，才能成为
+            # 后续有界兜底候选；被 max_followup_turns 或间隔抑制的消息不登记。
+            if message_id:
+                self._bot_directed_target_ids.add((session_id, message_id))
             message = dict(message)
             message["is_mentioned"] = True
             kwargs["message"] = message

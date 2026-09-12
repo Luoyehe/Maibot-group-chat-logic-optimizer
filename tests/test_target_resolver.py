@@ -761,6 +761,7 @@ def test_bare_url_is_not_technical_only_because_of_http() -> None:
     assert plugin._is_technical(url) is False
     assert plugin._is_technical(f"看看这个 {url}") is False
     assert plugin._is_technical(f"这个 API 报错看看 {url}") is True
+    assert plugin._is_technical("https://example.com，这个API报错怎么办") is True
 
 
 def test_url_inherits_nearby_technical_context() -> None:
@@ -773,6 +774,19 @@ def test_url_inherits_nearby_technical_context() -> None:
     }
     assert plugin._is_technical_reply_target(session, "link", "https://example.com/log") is True
     assert plugin._is_technical_reply_target(session, "chat", "中午吃点什么") is False
+
+
+def test_url_technical_context_is_bounded_by_fallback_window() -> None:
+    plugin = load_plugin()
+    session = "group:test"
+    plugin._context_cache[session] = {
+        "tech": {"order": 0, "text": "这个模型 API 报错了", "user": "1", "is_self": False},
+        "filler1": {"order": 1, "text": "吃火锅", "user": "2", "is_self": False},
+        "filler2": {"order": 2, "text": "看电影", "user": "3", "is_self": False},
+        "filler3": {"order": 3, "text": "准备睡觉", "user": "4", "is_self": False},
+        "link": {"order": 4, "text": "https://example.com", "user": "1", "is_self": False},
+    }
+    assert plugin._is_technical_reply_target(session, "link", "https://example.com") is False
 
 
 def test_canceled_reply_falls_back_to_earlier_resolver_target() -> None:
@@ -825,3 +839,90 @@ def test_canceled_reply_falls_back_to_earlier_resolver_target() -> None:
     reply_calls = [call for call in calls if call[0] == "reply"]
     assert len(reply_calls) == 1
     assert reply_calls[0][1]["msg_id"] == "directed"
+
+
+def test_malformed_canceled_reply_does_not_target_unrelated_latest() -> None:
+    plugin = load_plugin()
+    session = "group:test"
+    plugin._context_cache[session] = {
+        "bot": {"order": 0, "text": "我说完了", "user": "测试机器人", "is_self": True},
+        "latest": {
+            "order": 1,
+            "text": "无关闲聊",
+            "user": "2",
+            "is_self": False,
+            "is_at": False,
+            "is_mentioned": False,
+        },
+    }
+    malformed_reply = {
+        "item_type": "FunctionCallItem",
+        "meta": {},
+        "tool_call": {"func_name": "reply", "args": {}},
+    }
+
+    result = asyncio.run(plugin.planner_after_response(session_id=session, output_items=[malformed_reply]))
+    calls = [
+        plugin._function_call(item)[0]
+        for item in result["modified_kwargs"]["output_items"]
+        if isinstance(item, dict)
+    ]
+    assert "reply" not in calls
+
+
+def test_malformed_canceled_reply_does_not_target_directed_history() -> None:
+    plugin = load_plugin()
+    session = "group:test"
+    plugin._context_cache[session] = {
+        "bot": {"order": 0, "text": "我说完了", "user": "测试机器人", "is_self": True},
+        "directed": {
+            "order": 1,
+            "text": "测试机器人，看看这个",
+            "user": "1",
+            "is_self": False,
+            "is_at": True,
+            "is_mentioned": True,
+        },
+        "latest": {
+            "order": 2,
+            "text": "无关闲聊",
+            "user": "2",
+            "is_self": False,
+            "is_at": False,
+            "is_mentioned": False,
+        },
+    }
+    malformed_reply = {
+        "item_type": "FunctionCallItem",
+        "meta": {},
+        "tool_call": {"func_name": "reply", "args": {}},
+    }
+
+    result = asyncio.run(plugin.planner_after_response(session_id=session, output_items=[malformed_reply]))
+    calls = [
+        plugin._function_call(item)[0]
+        for item in result["modified_kwargs"]["output_items"]
+        if isinstance(item, dict)
+    ]
+    assert "reply" not in calls
+
+
+def test_followup_suppressed_resolver_target_is_not_fallback_candidate() -> None:
+    plugin = load_plugin()
+    plugin.config.access.group_list = ["123"]
+    session = "group:test"
+    now = time.monotonic()
+    plugin._last_success_reply[session] = {
+        "updated_at": now,
+        "message_id": "b1",
+        "text": "刚回答过",
+        "target_user": "1",
+        "followup_count": plugin.config.followup.max_followup_turns,
+        "resolver_last_at": now,
+    }
+    current = message("u1", "1", "那你是谁？")
+
+    result = asyncio.run(plugin.central_access_control(message=current))
+
+    assert result == {"action": "continue", "modified_kwargs": {}}
+    assert (session, "u1") not in plugin._bot_directed_target_ids
