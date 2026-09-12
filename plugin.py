@@ -30,6 +30,10 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 _MESSAGE_RE = re.compile(r"<message\b(?P<attrs>[^>]*)>\s*(?P<body>.*?)(?:</message>|(?=<message\b)|$)", re.S | re.I)
 _ATTR_RE = re.compile(r"([\w:-]+)\s*=\s*[\"']?([^\"'\s>]+)[\"']?", re.I)
+_URL_RE = re.compile(
+    r"(?:https?://|www\.)\S+|\b[a-z0-9.-]+\.(?:com|net|org|io|dev|ai|edu|gov|me|cc)\b(?:/\S*)?",
+    re.I,
+)
 _TECH_KEYWORDS = (
     "api", "codex", "openai", "anthropic", "claude", "model", "endpoint",
     "error", "capacity", "rate limit", "timeout", "http", "dns",
@@ -49,7 +53,7 @@ class PluginSwitchConfig(PluginConfigBase):
     __ui_icon__ = "shield-check"
     __ui_order__ = 0
     enabled: bool = Field(default=True, description="是否启用群聊逻辑优化")
-    config_version: str = Field(default="2.0.4", description="配置版本")
+    config_version: str = Field(default="2.0.5", description="配置版本")
 
 
 class LatencyConfig(PluginConfigBase):
@@ -270,7 +274,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         self._embedding_source_warned = False
         self._next_state_cleanup_at = 0.0
         self._reply_total: Dict[str, int] = {}
-        self._explicit_bot_target_ids: set[Tuple[str, str]] = set()
+        self._bot_directed_target_ids: set[Tuple[str, str]] = set()
         self._whitelist_logged: set[Tuple[str, str]] = set()
         self._host_bot_aliases: List[str] = []
         self._host_bot_user_id = ""
@@ -1144,12 +1148,12 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                     self._target_state.pop(key, None)
             except (TypeError, ValueError):
                 self._target_state.pop(key, None)
-        for key in list(self._explicit_bot_target_ids):
+        for key in list(self._bot_directed_target_ids):
             session_id, _message_id = key
             if session_id not in self._context_cache and session_id not in self._session_dialogue:
-                self._explicit_bot_target_ids.discard(key)
-        if len(self._explicit_bot_target_ids) > 2048:
-            self._explicit_bot_target_ids.clear()
+                self._bot_directed_target_ids.discard(key)
+        if len(self._bot_directed_target_ids) > 2048:
+            self._bot_directed_target_ids.clear()
         text_cooldown = max(1, int(self.config.reply_safety.duplicate_text_cooldown_seconds))
         for session_id, queue in list(self._recent_texts.items()):
             while queue and now - float(queue[0][0]) > text_cooldown:
@@ -1514,8 +1518,51 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         }
 
     def _is_technical(self, text: str) -> bool:
-        lowered = text.lower()
+        """判断去掉 URL 后的文本是否含明确技术信号。
+
+        裸 URL 中的 http、域名或路径不应单独把消息判成技术话题；
+        但“URL + 报错/模型/API”等剩余文本仍按技术消息处理。
+        """
+
+        lowered = _URL_RE.sub(" ", str(text or "")).lower()
         return any(keyword.lower() in lowered for keyword in _TECH_KEYWORDS)
+
+    def _is_technical_reply_target(self, session_id: str, msg_id: str, text: str) -> bool:
+        """结合当前轮邻近上下文判断 reply 目标是否属于技术话题。
+
+        规则：
+        1. URL 先移除，剩余文本出现报错、模型、API、部署等关键词时视为技术；
+        2. 裸 URL 本身不视为技术；
+        3. 裸 URL 前的同轮近期消息已在讨论技术问题时，该 URL 视为技术上下文；
+        4. 普通闲聊链接不触发技术旁观保护，交由 Planner 正常决策。
+        """
+
+        source_text = str(text or "")
+        if self._is_technical(source_text):
+            return True
+        if not _URL_RE.search(source_text):
+            return False
+
+        records = self._current_turn_nonself_records(session_id)
+        target_order = None
+        target_info: Optional[Dict[str, Any]] = None
+        for record_id, info in records:
+            if record_id == msg_id:
+                target_order = int(info.get("order", -1))
+                target_info = info
+                break
+        if target_order is None or target_info is None:
+            return False
+
+        max_age = max(10, int(self.config.reply_fallback.max_age_seconds))
+        for _record_id, info in reversed(records):
+            if int(info.get("order", -1)) >= target_order:
+                continue
+            if self._context_record_is_too_old(info, max_age):
+                continue
+            if self._is_technical(str(info.get("text", "") or "")):
+                return True
+        return False
 
     def _latest_nonself_context(self, session_id: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         """返回本轮上下文中顺序最新的非机器人消息。"""
@@ -1549,12 +1596,12 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         records.sort(key=lambda record: int(record[1].get("order", -1)))
         return records
 
-    def _is_explicit_context_target(self, session_id: str, msg_id: str, info: Dict[str, Any]) -> bool:
+    def _is_bot_directed_context_target(self, session_id: str, msg_id: str, info: Dict[str, Any]) -> bool:
         text = str(info.get("text", "") or "")
         aliases = self._normalize_aliases()
         return (
             bool(info.get("is_at"))
-            or (session_id, msg_id) in self._explicit_bot_target_ids
+            or (session_id, msg_id) in self._bot_directed_target_ids
             or any(alias in text for alias in aliases)
             or "@机器人" in text
         )
@@ -1683,7 +1730,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         if (
             self.config.technical.enabled
             and bool(self._session_group_ids.get(session_id))
-            and self._is_technical(text)
+            and self._is_technical_reply_target(session_id, msg_id, text)
             and not (
                 bool(info.get("is_at"))
                 or bool(info.get("is_mentioned"))
@@ -1700,7 +1747,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                 ).strip()
         if (
             self.config.technical.enabled
-            and self._is_technical(text)
+            and self._is_technical_reply_target(session_id, msg_id, text)
             and (bool(info.get("is_at")) or bool(info.get("is_mentioned")) or any(alias in text for alias in aliases))
         ):
             args["reply_reference"] = (
@@ -1722,7 +1769,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             "updated_at": time.monotonic(),
             "order": order,
             "quote_allowed": quote_allowed,
-            "technical": self.config.technical.enabled and self._is_technical(text),
+            "technical": self.config.technical.enabled and self._is_technical_reply_target(session_id, msg_id, text),
             "target_updated_at": float((inbound_state or {}).get("updated_at", 0.0) or 0.0),
             "target_user": str(
                 (self._recent_inbound_users.get((session_id, msg_id)) or {}).get("user_id", "")
@@ -1737,8 +1784,15 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         }
         return raw, ""
 
-    def _forced_reply_fallback(self, session_id: str, source_item: Any, output_items: Optional[List[Any]] = None) -> Tuple[Optional[Dict[str, Any]], str]:
-        """有界安全兜底：只扫最近机器人发言后的少量明确指向消息。"""
+    def _forced_reply_fallback(
+        self,
+        session_id: str,
+        source_item: Any,
+        output_items: Optional[List[Any]] = None,
+        *,
+        canceled_reply_intent: bool = False,
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """有界安全兜底：只扫最近机器人发言后的少量机器人指向消息。"""
 
         if not self.config.reply_fallback.enabled:
             return None, ""
@@ -1756,19 +1810,19 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             return None, ""
 
         latest_id, latest_info = records[-1]
-        planner_wants_reply = self._analysis_requests_reply(output_items)
-        explicit_records = [
+        planner_wants_reply = bool(canceled_reply_intent) or self._analysis_requests_reply(output_items)
+        directed_records = [
             (msg_id, info)
             for msg_id, info in records
-            if self._is_explicit_context_target(session_id, msg_id, info)
+            if self._is_bot_directed_context_target(session_id, msg_id, info)
         ]
 
-        if self._is_explicit_context_target(session_id, latest_id, latest_info):
+        if self._is_bot_directed_context_target(session_id, latest_id, latest_info):
             target_id, target_info = latest_id, latest_info
-        elif explicit_records:
+        elif directed_records:
             if self.config.reply_fallback.require_planner_intent_for_history and not planner_wants_reply:
                 return None, ""
-            target_id, target_info = explicit_records[-1]
+            target_id, target_info = directed_records[-1]
         elif planner_wants_reply:
             target_id, target_info = latest_id, latest_info
         else:
@@ -1793,7 +1847,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                     "msg_id": target_id,
                     "set_quote": False,
                     "reply_reference": (
-                        "【强制回复兜底】用户明确@或称呼机器人，但Planner未发出reply工具。"
+                        "【强制回复兜底】用户消息已指向机器人，或Planner已有回复意图但目标被安全规则取消。"
                         f"用户原话：{preview}。请自然、简短、直接回应用原话，不要编造。"
                     ),
                     "reply_style": "正常回复",
@@ -1828,6 +1882,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         new_items: List[Any] = []
         terminal_seen = False
         wait_seen = False
+        canceled_reply_intent = False
         rejected: list[str] = []
         for item in output_items:
             if not isinstance(item, dict):
@@ -1844,6 +1899,9 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             if name == "reply" and not terminal_seen:
                 normalized, reason = self._normalize_reply_item(session_id, item, args)
                 if normalized is None:
+                    # reply 已证明 Planner 有可见回复意图；即目标被安全规则取消，
+                    # 也不能直接丢掉本轮意图，应让有界兜底尝试更早的有效目标。
+                    canceled_reply_intent = True
                     rejected.append(reason)
                     new_items.append(self._assistant_note(item, reason))
                 else:
@@ -1901,7 +1959,12 @@ class GroupChatLogicPlugin(MaiBotPlugin):
         # 也必须产生可见 reply，而不是把“应该回复”留在分析里。
         if not terminal_seen:
             source_item = next((item for item in reversed(output_items) if isinstance(item, dict)), None)
-            forced_reply, forced_reason = self._forced_reply_fallback(session_id, source_item, output_items)
+            forced_reply, forced_reason = self._forced_reply_fallback(
+                session_id,
+                source_item,
+                output_items,
+                canceled_reply_intent=canceled_reply_intent,
+            )
             if forced_reply is not None:
                 # 移除错误选择的 wait，确保 reply 立即执行。
                 new_items = [
@@ -2296,7 +2359,7 @@ class GroupChatLogicPlugin(MaiBotPlugin):
             explicit_bot = bool(metadata.get("explicit_bot", False))
             if explicit_bot:
                 if message_id:
-                    self._explicit_bot_target_ids.add((session_id, message_id))
+                    self._bot_directed_target_ids.add((session_id, message_id))
                 # 显式点名开启新的对话轮，清空旧连续对话计数。
                 if isinstance(last_reply, dict):
                     last_reply["followup_count"] = 0
@@ -2332,6 +2395,11 @@ class GroupChatLogicPlugin(MaiBotPlugin):
                 ) and isinstance(last_reply, dict):
                     last_reply["followup_count"] = 0
                 return {"action": "continue", "modified_kwargs": {}}
+
+            # resolver 判定为机器人的消息也进入有界兜底候选。Planner 上下文
+            # 序列化会丢失运行时 is_mentioned 标记，不能只依赖字面 @/昵称。
+            if message_id:
+                self._bot_directed_target_ids.add((session_id, message_id))
 
             try:
                 followup_count = int(last_reply.get("followup_count", 0) or 0) if isinstance(last_reply, dict) else 0

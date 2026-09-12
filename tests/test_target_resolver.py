@@ -753,3 +753,75 @@ def test_technical_guard_uses_runtime_group_mapping() -> None:
     normalized, reason = plugin._normalize_reply_item(session, item, {"msg_id": "latest"})
     assert normalized is None
     assert "技术消息" in reason
+
+
+def test_bare_url_is_not_technical_only_because_of_http() -> None:
+    plugin = load_plugin()
+    url = "https://github.com/Luoyehe/Maibot-group-chat-logic-optimizer"
+    assert plugin._is_technical(url) is False
+    assert plugin._is_technical(f"看看这个 {url}") is False
+    assert plugin._is_technical(f"这个 API 报错看看 {url}") is True
+
+
+def test_url_inherits_nearby_technical_context() -> None:
+    plugin = load_plugin()
+    session = "group:test"
+    plugin._context_cache[session] = {
+        "tech": {"order": 0, "text": "这个模型 API 报错了", "user": "1", "is_self": False},
+        "link": {"order": 1, "text": "https://example.com/log", "user": "1", "is_self": False},
+        "chat": {"order": 2, "text": "中午吃点什么", "user": "2", "is_self": False},
+    }
+    assert plugin._is_technical_reply_target(session, "link", "https://example.com/log") is True
+    assert plugin._is_technical_reply_target(session, "chat", "中午吃点什么") is False
+
+
+def test_canceled_reply_falls_back_to_earlier_resolver_target() -> None:
+    plugin = load_plugin()
+    session = "group:test"
+    plugin._session_group_ids[session] = "123"
+    plugin._context_cache[session] = {
+        "bot": {"order": 0, "text": "早呀，昨晚修bug辛苦啦", "user": "测试机器人", "is_self": True},
+        "directed": {
+            "order": 1,
+            "text": "后面搞到早上六点多",
+            "user": "1",
+            "is_self": False,
+            "is_at": False,
+            "is_mentioned": False,
+        },
+        "technical": {
+            "order": 2,
+            "text": "这个模型 API 报错了",
+            "user": "1",
+            "is_self": False,
+            "is_at": False,
+            "is_mentioned": False,
+        },
+        "link": {
+            "order": 3,
+            "text": "https://github.com/Luoyehe/Maibot-group-chat-logic-optimizer",
+            "user": "1",
+            "is_self": False,
+            "is_at": False,
+            "is_mentioned": False,
+        },
+    }
+    plugin._bot_directed_target_ids.add((session, "directed"))
+    canceled_reply = {
+        "item_type": "FunctionCallItem",
+        "meta": {},
+        "tool_call": {
+            "func_name": "reply",
+            "args": {"msg_id": "link", "set_quote": False, "text": "看看这个链接"},
+        },
+    }
+
+    result = asyncio.run(plugin.planner_after_response(session_id=session, output_items=[canceled_reply]))
+    calls = [
+        plugin._function_call(item)[:2]
+        for item in result["modified_kwargs"]["output_items"]
+        if isinstance(item, dict)
+    ]
+    reply_calls = [call for call in calls if call[0] == "reply"]
+    assert len(reply_calls) == 1
+    assert reply_calls[0][1]["msg_id"] == "directed"
